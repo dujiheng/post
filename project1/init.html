@@ -1,0 +1,412 @@
+<html lang="en">
+	<head>
+		<title> WebGL </title>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0"/>
+		<style>
+			body {
+				color: #ffffff;
+				font-family:Monospace;
+				font-size:13px;
+				text-align:center;
+				font-weight: bold;
+
+				background-color: #050505;
+				margin: 0px;
+				overflow: hidden;
+			}
+
+			#info {
+				position: absolute;
+				top: 0px; width: 100%;
+				padding: 5px;
+			}
+
+			a {
+				color: #ffffff;
+			}
+
+			#oldie a { color:#da0 }
+		</style>
+	</head>
+	<body>
+		<div id="container">
+			<div>Transfer function</div>
+			0.0<img id="transferFunctionImg" style="align:right"/>1.0
+		</div>
+		<script src="./js/three.js"></script>
+		<script src="./js/OrbitControls.js"></script>
+		<script src="./js/dat.gui.min.js"></script>
+
+		<script id="vertexShaderFirstPass" type="x-shader/x-vertex">
+			varying vec3 worldSpaceCoords;
+
+			void main()
+			{
+				//设置世界空间坐标的后面的空间坐标作为输出
+				worldSpaceCoords = position + vec3(0.5, 0.5, 0.5); //从 [-0.5;0.5] 移到 [0,1]
+				gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+			}
+		</script>
+
+		<script id="fragmentShaderFirstPass" type="x-shader/x-fragment">
+			varying vec3 worldSpaceCoords;
+
+			void main()
+			{
+				//片段的世界空间坐标为片段的输出
+				gl_FragColor = vec4( worldSpaceCoords.x , worldSpaceCoords.y, worldSpaceCoords.z, 1 );
+			}
+		</script>
+
+		<script id="vertexShaderSecondPass" type="x-shader/x-vertex">
+			varying vec3 worldSpaceCoords;
+			varying vec4 projectedCoords;
+
+			void main()
+			{
+				worldSpaceCoords = (modelMatrix * vec4(position + vec3(0.5, 0.5,0.5), 1.0 )).xyz;
+				gl_Position = projectionMatrix *  modelViewMatrix * vec4( position, 1.0 );
+				projectedCoords =  projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+			}
+		</script>
+
+		<script id="fragmentShaderSecondPass" type="x-shader/x-fragment">
+			varying vec3 worldSpaceCoords;
+			varying vec4 projectedCoords;
+			uniform sampler2D tex, cubeTex, transferTex;
+			uniform float steps;
+			uniform float alphaCorrection;
+
+			//射线最大发射距离为 体对角线 ： 512*sqrt（3）
+			const int MAX_STEPS = 887;
+
+			//texture2D + Z片
+			vec4 sampleAs3DTexture( vec3 texCoord )
+			{
+				vec4 colorSlice1, colorSlice2;
+				vec2 texCoordSlice1, texCoordSlice2;
+
+				//依据Z坐标确定哪个是我们寻找的Z片
+				//Z片的范围（0,255）
+				float zSliceNumber1 = floor(texCoord.z  * 255.0);
+
+				//当我们使用三线性时，我们要使用下一个Z片
+				float zSliceNumber2 = min( zSliceNumber1 + 1.0, 255.0); //Clamp to 255
+
+				//Z切片被存储在一个16*16的矩阵中作为一个Z片
+				//原始的UV坐标通过贴图的行列号必须重新调整
+				texCoord.xy /= 16.0;
+
+				texCoordSlice1 = texCoordSlice2 = texCoord.xy;
+
+				//根据行列号对原始的uv坐标添加偏移量
+				texCoordSlice1.x += (mod(zSliceNumber1, 16.0 ) / 16.0);
+				texCoordSlice1.y += floor((255.0 - zSliceNumber1) / 16.0) / 16.0;
+
+				texCoordSlice2.x += (mod(zSliceNumber2, 16.0 ) / 16.0);
+				texCoordSlice2.y += floor((255.0 - zSliceNumber2) / 16.0) / 16.0;
+
+				//从2D纹理中获取不透明值
+				//默认情况下，双线性过滤在每个 texture2D 中完成。
+				colorSlice1 = texture2D( cubeTex, texCoordSlice1 );
+				colorSlice2 = texture2D( cubeTex, texCoordSlice2 );
+
+				//在之前获得的不透明度中，在传输函数中获得RGB颜色
+				colorSlice1.rgb = texture2D( transferTex, vec2( colorSlice1.a, 1.0) ).rgb;
+				colorSlice2.rgb = texture2D( transferTex, vec2( colorSlice2.a, 1.0) ).rgb;
+
+				//Z1切片到Z2切片的距离有多远。在两个Z 片之间运用插值。
+				float zDifference = mod(texCoord.z * 255.0, 1.0);
+
+				//最后在每个Z片的两者中间颜色之间进行插值（做临近颜色混合）。
+				return mix(colorSlice1, colorSlice2, zDifference) ;
+			}
+
+
+			void main( void ) {
+
+				//从【-1,1】移到【0,1】
+				vec2 texc = vec2(((projectedCoords.x / projectedCoords.w) + 1.0 ) / 2.0,
+								((projectedCoords.y / projectedCoords.w) + 1.0 ) / 2.0 );
+
+				//背部位置是世界坐标中位置出存在texture中。
+				vec3 backPos = texture2D(tex, texc).xyz;
+
+				//前面位置是世界坐标顶点属于第二渲染过程
+				vec3 frontPos = worldSpaceCoords;
+
+				//前后位置向量（方向）（长度）
+				vec3 dir = backPos - frontPos;
+
+				float rayLength = length(dir);
+
+				//计算每步增量。
+				float delta = 1.0 / steps;
+
+				//每步各个方向的增量。
+				vec3 deltaDirection = normalize(dir) * delta;
+				float deltaDirectionLength = length(deltaDirection);
+
+				//启动射线投射从前面位置
+				vec3 currentPosition = frontPos;
+
+				//颜色计数器
+				vec4 accumulatedColor = vec4(0.0);
+
+				//透明度值计数器（目前为止的透明度）
+				float accumulatedAlpha = 0.0;
+
+				//射线行进长的长度（目前为止的长度）
+				float accumulatedLength = 0.0;
+
+				//若有两倍的样本，仅需每个样本约1/2的透射度。
+				//缩放266/10，仅仅发生在恰好给透射度修正一个很好的值
+				float alphaScaleFactor = 25.6 * delta;
+
+				vec4 colorSample;
+				float alphaSample;
+
+				//执行射线行进迭代
+				for(int i = 0; i < MAX_STEPS; i++)
+				{
+					//从3Dtexture 中获取体素亮度值
+					colorSample = sampleAs3DTexture( currentPosition );
+
+					//允许透射修正用户制定
+					alphaSample = colorSample.a * alphaCorrection;
+
+					//允许这种修正结果作用在颜色累加器和透射度累加器增加真实透明性。
+					alphaSample *= (1.0 - accumulatedAlpha);
+
+					//按照步的数目来扩展投射度的值， 使最终的颜色不变。
+					alphaSample *= alphaScaleFactor;
+					
+					//完成组合（颜色累加）
+					accumulatedColor += colorSample * alphaSample;
+
+					//透射度累加
+					accumulatedAlpha += alphaSample;
+
+					//射线行进
+					currentPosition += deltaDirection;
+					accumulatedLength += deltaDirectionLength;
+
+					//跳出循环（条件）
+					if(accumulatedLength >= rayLength || accumulatedAlpha >= 1.0 )
+						break;
+				}
+
+				gl_FragColor  = accumulatedColor;
+
+			}
+		</script>
+
+
+		<script>
+
+			var container;
+			var camera, sceneFirstPass, sceneSecondPass, renderer;
+
+			var clock = new THREE.Clock();
+			var rtTexture, transferTexture;
+			var cubeTextures = ['MRI-Head', 'baby'];
+			var histogram = [];
+			var guiControls;
+
+			var materialSecondPass;
+			init();
+			animate();
+
+			function init() {
+
+				//Parameters that can be modified.
+				guiControls = new function() {
+					this.数据 = 'MRI-Head';
+					this.步 = 256.0;
+					this.透明度修正 = 1.0;
+					this.绿色 = "#00FA58";
+					this.绿色步长方位 = 0.1;
+					this.红色 = "#CC6600";
+					this.红色步长方位 = 0.7;
+					this.黄色 = "#F2F200";
+					this.黄色步长方位 = 1.0;
+				};
+
+				container = document.getElementById( 'container' );
+
+				camera = new THREE.PerspectiveCamera( 40, window.innerWidth / window.innerHeight, 0.01, 3000.0 );
+				camera.position.z = 2.0;
+
+				controls = new THREE.OrbitControls( camera, container );
+				controls.center.set( 0.0, 0.0, 0.0 );
+
+
+				//Load the 2D texture containing the Z slices.
+				cubeTextures['baby'] = THREE.ImageUtils.loadTexture('Baby.raw.png' );
+				cubeTextures['MRI-Head'] = THREE.ImageUtils.loadTexture('MRI-Head.raw.png');
+
+
+				//Don't let it generate mipmaps to save memory and apply linear filtering to prevent use of LOD.
+				cubeTextures['baby'].generateMipmaps = false;
+				cubeTextures['baby'].minFilter = THREE.LinearFilter;
+				cubeTextures['baby'].magFilter = THREE.LinearFilter;
+
+
+				cubeTextures['MRI-Head'].generateMipmaps = false;
+				cubeTextures['MRI-Head'].minFilter = THREE.LinearFilter;
+				cubeTextures['MRI-Head'].magFilter = THREE.LinearFilter;
+
+
+				var transferTexture = updateTransferFunction();
+
+				var screenSize = new THREE.Vector2( window.innerWidth, window.innerHeight );
+				rtTexture = new THREE.WebGLRenderTarget( screenSize.x, screenSize.y,
+														{ 	minFilter: THREE.LinearFilter,
+															magFilter: THREE.LinearFilter,
+															wrapS:  THREE.ClampToEdgeWrapping,
+															wrapT:  THREE.ClampToEdgeWrapping,
+															format: THREE.RGBFormat,
+															type: THREE.FloatType,
+															generateMipmaps: false} );
+
+
+				var materialFirstPass = new THREE.ShaderMaterial( {
+					vertexShader: document.getElementById( 'vertexShaderFirstPass' ).textContent,
+					fragmentShader: document.getElementById( 'fragmentShaderFirstPass' ).textContent,
+					side: THREE.BackSide
+				} );
+
+				materialSecondPass = new THREE.ShaderMaterial( {
+					vertexShader: document.getElementById( 'vertexShaderSecondPass' ).textContent,
+					fragmentShader: document.getElementById( 'fragmentShaderSecondPass' ).textContent,
+					side: THREE.FrontSide,
+					uniforms: {	tex:  { type: "t", value: rtTexture },
+								cubeTex:  { type: "t", value: cubeTextures['MRI-Head'] },
+								transferTex:  { type: "t", value: transferTexture },
+								steps : {type: "1f" , value: guiControls.步 },
+								alphaCorrection : {type: "1f" , value: guiControls.透明度修正 }}
+				 });
+
+				sceneFirstPass = new THREE.Scene();
+				sceneSecondPass = new THREE.Scene();
+
+				var boxGeometry = new THREE.BoxGeometry(1.0, 1.0, 1.0);
+				boxGeometry.doubleSided = true;
+
+				var meshFirstPass = new THREE.Mesh( boxGeometry, materialFirstPass );
+				var meshSecondPass = new THREE.Mesh( boxGeometry, materialSecondPass );
+
+				sceneFirstPass.add( meshFirstPass );
+				sceneSecondPass.add( meshSecondPass );
+
+				renderer = new THREE.WebGLRenderer();
+				container.appendChild( renderer.domElement );
+
+
+
+				var gui = new dat.GUI();
+				var modelSelected = gui.add(guiControls, '数据', [ 'MRI-Head', 'baby' ] );
+				gui.add(guiControls, '步', 0.0, 512.0);
+				gui.add(guiControls, '透明度修正', 0.01, 5.0).step(0.01);
+
+				modelSelected.onChange(function(value) { materialSecondPass.uniforms.cubeTex.value =  cubeTextures[value]; } );
+
+
+				//Setup transfer function steps.
+				var step1Folder = gui.addFolder('颜色——绿');
+				var controllerColor1 = step1Folder.addColor(guiControls, '绿色');
+				var controllerStepPos1 = step1Folder.add(guiControls, '绿色步长方位', 0.0, 1.0);
+				controllerColor1.onChange(updateTextures);
+				controllerStepPos1.onChange(updateTextures);
+
+				var step2Folder = gui.addFolder('颜色——红');
+				var controllerColor2 = step2Folder.addColor(guiControls, '红色');
+				var controllerStepPos2 = step2Folder.add(guiControls, '红色步长方位', 0.0, 1.0);
+				controllerColor2.onChange(updateTextures);
+				controllerStepPos2.onChange(updateTextures);
+
+				var step3Folder = gui.addFolder('颜色——黄');
+				var controllerColor3 = step3Folder.addColor(guiControls, '黄色');
+				var controllerStepPos3 = step3Folder.add(guiControls, '黄色步长方位', 0.0, 1.0);
+				controllerColor3.onChange(updateTextures);
+				controllerStepPos3.onChange(updateTextures);
+
+				step1Folder.open();
+				step2Folder.open();
+				step3Folder.open();
+
+
+				onWindowResize();
+
+				window.addEventListener( 'resize', onWindowResize, false );
+
+			}
+
+			function updateTextures(value)
+			{
+				materialSecondPass.uniforms.transferTex.value = updateTransferFunction();
+			}
+			function updateTransferFunction()
+			{
+				var canvas = document.createElement('canvas');
+				canvas.height = 20;
+				canvas.width = 256;
+
+				var ctx = canvas.getContext('2d');
+
+				var grd = ctx.createLinearGradient(0, 0, canvas.width -1 , canvas.height - 1);
+				grd.addColorStop(guiControls.绿色步长方位, guiControls.绿色);
+				grd.addColorStop(guiControls.红色步长方位, guiControls.红色);
+				grd.addColorStop(guiControls.黄色步长方位, guiControls.黄色);
+
+				ctx.fillStyle = grd;
+				ctx.fillRect(0,0,canvas.width -1 ,canvas.height -1 );
+
+				var img = document.getElementById("transferFunctionImg");
+				img.src = canvas.toDataURL();
+				img.style.width = "256 px";
+				img.style.height = "128 px";
+
+				transferTexture =  new THREE.Texture(canvas);
+				transferTexture.wrapS = transferTexture.wrapT =  THREE.ClampToEdgeWrapping;
+				transferTexture.needsUpdate = true;
+
+				return transferTexture;
+			}
+
+			function onWindowResize( event ) {
+
+				camera.aspect = window.innerWidth / window.innerHeight;
+				camera.updateProjectionMatrix();
+
+				renderer.setSize( window.innerWidth, window.innerHeight );
+			}
+
+			function animate() {
+
+				requestAnimationFrame( animate );
+
+				render();
+			}
+
+			function render() {
+
+				var delta = clock.getDelta();
+
+				//Render first pass and store the world space coords of the back face fragments into the texture.
+				//渲染第一次通过，在纹理中储存背面片段世界空间坐标。
+				renderer.render( sceneFirstPass, camera, rtTexture, true );
+
+				//Render the second pass and perform the volume rendering.
+				//渲染第二次通过，执行体积渲染。
+				renderer.render( sceneSecondPass, camera );
+
+				materialSecondPass.uniforms.steps.value = guiControls.步;
+				materialSecondPass.uniforms.alphaCorrection.value = guiControls.透明度修正;
+			}
+
+		</script>
+
+	</body>
+</html>
